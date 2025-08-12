@@ -11,6 +11,7 @@ class CustomContrastiveLoss(nn.Module):
     """
     def __init__(self):
         super().__init__()
+        self.tau = 0.05  # 温度参数，控制相似度分布的平滑程度
 
     def forward(self, logits, labels, pad_mask, ad_idxs):
         B, S, D = logits.shape
@@ -21,36 +22,59 @@ class CustomContrastiveLoss(nn.Module):
         valid_flat = pad_mask.reshape(B * S).to(dtype=torch.bool)
         ad_flat = ad_idxs.reshape(B * S)
 
+        # L2 normalize
+        logits_flat = F.normalize(logits_flat, p=2, dim=-1)
+        labels_flat = F.normalize(labels_flat, p=2, dim=-1)
+
         # 相似度矩阵 [BS, BS]
         sim = torch.matmul(logits_flat, labels_flat.t())
+        sim = sim / self.tau
 
         # mask：只保留(valid, valid)的行列
         # 形状 [BS, BS]；True=有效，False=无效
         pair_valid = valid_flat.unsqueeze(0) & valid_flat.unsqueeze(1)
-        mask = pair_valid.to(sim.dtype)
-
         # 将无效位置置为极小，避免 softmax 把概率分给无效列
         sim = sim.masked_fill(~pair_valid, float("-inf"))
 
-        # softmax over columns
-        # sim[i][j]表示预测的第i个位置的embedding与真实的第j个位置的embedding的相似度
-        sim_prob = F.softmax(sim, dim=-1)
+        # 正样掩码：同 ad_id 且 (valid, valid)
+        pos_mask = (ad_flat.unsqueeze(0) == ad_flat.unsqueeze(1)) & pair_valid
 
-        # 监督：同 ad_id 视为正样（按列）
-        label_mat = (ad_flat.unsqueeze(0) == ad_flat.unsqueeze(1)) & pair_valid
-        label_mat = label_mat.to(sim_prob.dtype)
+        # 多正样 InfoNCE：
+        # loss_i = -log( sum_{j in P_i} exp(sim_ij) / sum_{k in A_i} exp(sim_ik) )
+        # 其中 A_i 是该行有效列集合（mask 后）
+        pos_sim = sim.masked_fill(~pos_mask, float("-inf"))   # 非正样置 -inf
+        pos_lse = torch.logsumexp(pos_sim, dim=-1)            # log sum exp over positives
+        all_lse = torch.logsumexp(sim,     dim=-1)            # log sum exp over all valid
 
-        # 只对正样位置计算 -log2(p)
-        # 避免 log(0)
-        eps = 1e-12
-        # 将一个batch内所有非labels的样本全部作为负样本。
-        pos_loss = -torch.log2(sim_prob.clamp_min(eps)) * label_mat
+        # 仅统计“该行至少有一个正样”的样本
+        has_pos = pos_mask.any(dim=-1)  # [BS]
+        loss_per_row = -(pos_lse - all_lse)                   # [BS]
+        loss = loss_per_row[has_pos].mean()
+        return loss
+        # # 兜底：行是否全被禁
+        # row_all_masked = ~pair_valid.any(dim=-1)         # [BS]
+        # if row_all_masked.any():
+        #     sim[row_all_masked] = 0.0                    # softmax(0...0)=均匀分布
 
-        # 按行求和，再对有效行取平均
-        loss_per_row = pos_loss.sum(dim=-1)
+        # # softmax over columns
+        # # sim[i][j]表示预测的第i个位置的embedding与真实的第j个位置的embedding的相似度
+        # sim_prob = F.softmax(sim, dim=-1)
 
-        # 仅统计有至少一个正样目标的有效行；若想与原逻辑完全一致，也可直接 mean()
-        # 这里与 Paddle 原写法一致：直接对所有行取均值
+        # # 监督：同 ad_id 视为正样（按列）
+        # label_mat = (ad_flat.unsqueeze(0) == ad_flat.unsqueeze(1)) & pair_valid
+        # label_mat = label_mat.to(sim_prob.dtype)
+
+        # # 只对正样位置计算 -log2(p)
+        # # 避免 log(0)
+        # eps = 1e-12
+        # # 将一个batch内所有非labels的样本全部作为负样本。
+        # pos_loss = -torch.log2(sim_prob.clamp_min(eps)) * label_mat
+
+        # # 按行求和，再对有效行取平均
+        # loss_per_row = pos_loss.sum(dim=-1)
+
+        # # 仅统计有至少一个正样目标的有效行；若想与原逻辑完全一致，也可直接 mean()
+        # # 这里与 Paddle 原写法一致：直接对所有行取均值
         loss = loss_per_row.mean()
         return loss
 
@@ -115,17 +139,31 @@ class SASRec(nn.Module):
         B, S, D = seqs.shape
         device = seqs.device
 
-        # 绝对位置编码（从1开始；padding位置为0 -> 使用 padding_idx=0）
-        pos = torch.arange(1, S + 1, device=device).unsqueeze(0).expand(B, S)
-        pos = pos * mask.to(pos.dtype)  # padding 处为0
-        seqs = seqs + self.pos_emb(pos.long())
+        # # 绝对位置编码（从1开始；padding位置为0 -> 使用 padding_idx=0）
+        # pos = torch.arange(1, S + 1, device=device).unsqueeze(0).expand(B, S)
+        # pos = pos * mask.to(pos.dtype)  # padding 处为0
+        # pos_emb = self.pos_emb(pos.long())  # [B, S, D]
+        # mask: True=有效，False=pad
+        pos_idx = mask.cumsum(dim=1) * mask      # 左侧 pad 保持 0，右侧得到 1..L
+        pos_emb = self.pos_emb(pos_idx.long())
+
+        seqs = seqs + pos_emb
         seqs = self.emb_dropout(seqs)
 
-        # 因果遮挡：上三角（不含对角线）为 True 代表禁止注意
-        # 形状 [S, S] 或 [B, S, S]；这里用 [S, S]
-        tl = S
-        attn_mask = torch.triu(torch.ones(tl, tl, dtype=torch.bool, device=device), diagonal=1)
-        key_padding_mask = ~mask.bool()          # [B, S]  True 表示要屏蔽的位置
+        # === 构造 3D 组合 mask: [B,S,S], True=屏蔽 ===
+        causal = torch.triu(torch.ones(S, S, dtype=torch.bool, device=device), diagonal=1)  # [S,S]
+        attn_mask = causal.unsqueeze(0).expand(B, -1, -1).clone()                           # [B,S,S]
+        # 屏蔽 key 为 padding 的列
+        attn_mask |= (~mask).unsqueeze(1).expand(B, S, S)                                   # [B,S,S]
+        # 对 query 为 padding 的行，整行不屏蔽（否则会全 True→-inf）
+        attn_mask &= mask.unsqueeze(-1).expand(B, S, S)                                     # [B,S,S]
+        # MultiheadAttention 支持 3D attn_mask 形状 [B*h, S, S]
+        num_heads = self.attention_layers[0].num_heads
+        attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)                           # [B*h,S,S]
+
+        # 也把 Q/K/V 的 pad 行/列置0（更干净）
+        pad_row = (~mask).unsqueeze(-1)   # [B,S,1]
+        seqs = seqs.masked_fill(pad_row, 0.0)
 
         for ln_attn, attn, ln_ffn, ffn in zip(
             self.attention_layernorms,
@@ -137,7 +175,9 @@ class SASRec(nn.Module):
             Q = ln_attn(seqs)
             # MultiheadAttention: (B, S, D), (B, S, D), (B, S, D)
             # attn_mask=True 表示 masked
-            mha_out, _ = attn(Q, seqs, seqs, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+            # mha_out, _ = attn(Q, seqs, seqs, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+            mha_out, _ = attn(Q, seqs, seqs, attn_mask=attn_mask)
+            # mha_out = mha_out.masked_fill(~mask.unsqueeze(-1), 0.0)  # padding位置置0
             seqs = seqs + mha_out  # 残差
 
             Y = ln_ffn(seqs)
