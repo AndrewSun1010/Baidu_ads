@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 # ✨ 使用你上面实现的新数据管道
 from stream_datasets import TrainStream, CollateWithStore
+from evaluate import evaluate
 from model import SASRec, CustomContrastiveLoss
 
 import random, numpy as np
@@ -118,6 +119,10 @@ scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.96, last_e
 # ----------------------------
 print("开始训练")
 global_step = 0
+# train_torch.py 训练循环里修改
+eval_every = 1000             # 每 N step 触发一次验证
+quick_eval_batches = 10       # 中途验证只跑前50个batch（加速）；想全量就设 None
+best_metrics = {"recall@10": 0.0, "ndcg@10": 0.0}
 
 for epoch in range(1, args.num_epochs + 1):
     if args.inference_only:
@@ -166,6 +171,12 @@ for epoch in range(1, args.num_epochs + 1):
         # 进度条上显示平滑 loss
         pbar.set_postfix(loss=(ema_loss if ema_loss is not None else l), lr=scheduler.get_last_lr()[0])
 
+        # —— 中途评估（快速）——
+        if (global_step % eval_every == 0):
+            quick_metrics = evaluate(model, args, device, max_batches=quick_eval_batches)
+            print(f"\n[QuickEval @ step {global_step}] " +
+                  ", ".join([f"{k}={v:.4f}" for k, v in quick_metrics.items()]))
+        model.train()  # 恢复训练模式
     # 学习率衰减
     scheduler.step()
     print(f"Epoch {epoch} done in {time.time()-epoch_t0:.1f}s, current lr: {scheduler.get_last_lr()[0]:.6f}")
@@ -173,7 +184,7 @@ for epoch in range(1, args.num_epochs + 1):
     # 保存
     today = date.today()
     day = today.strftime("%Y_%m_%d")
-    folder = os.path.join(parent_dir, day)
+    folder = os.path.join(parent_dir,'output',day)
     os.makedirs(folder, exist_ok=True)
 
     fname = 'SASRec.epoch={}.lr={}.layer={}.head={}.hidden={}.maxlen={}.pth'

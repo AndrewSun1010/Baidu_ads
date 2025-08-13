@@ -75,8 +75,8 @@ class CustomContrastiveLoss(nn.Module):
 
         # # 仅统计有至少一个正样目标的有效行；若想与原逻辑完全一致，也可直接 mean()
         # # 这里与 Paddle 原写法一致：直接对所有行取均值
-        loss = loss_per_row.mean()
-        return loss
+        # loss = loss_per_row.mean()
+        # return loss
 
 
 class PointWiseFeedForward(nn.Module):
@@ -153,17 +153,17 @@ class SASRec(nn.Module):
         # === 构造 3D 组合 mask: [B,S,S], True=屏蔽 ===
         causal = torch.triu(torch.ones(S, S, dtype=torch.bool, device=device), diagonal=1)  # [S,S]
         attn_mask = causal.unsqueeze(0).expand(B, -1, -1).clone()                           # [B,S,S]
-        # 屏蔽 key 为 padding 的列
-        attn_mask |= (~mask).unsqueeze(1).expand(B, S, S)                                   # [B,S,S]
-        # 对 query 为 padding 的行，整行不屏蔽（否则会全 True→-inf）
-        attn_mask &= mask.unsqueeze(-1).expand(B, S, S)                                     # [B,S,S]
-        # MultiheadAttention 支持 3D attn_mask 形状 [B*h, S, S]
-        num_heads = self.attention_layers[0].num_heads
-        attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)                           # [B*h,S,S]
+        # # 屏蔽 key 为 padding 的列
+        # attn_mask |= (~mask).unsqueeze(1).expand(B, S, S)                                   # [B,S,S]
+        # # 对 query 为 padding 的行，整行不屏蔽（否则会全 True→-inf）
+        # attn_mask &= mask.unsqueeze(-1).expand(B, S, S)                                     # [B,S,S]
+        # # MultiheadAttention 支持 3D attn_mask 形状 [B*h, S, S]
+        # num_heads = self.attention_layers[0].num_heads
+        # attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)                           # [B*h,S,S]
 
         # 也把 Q/K/V 的 pad 行/列置0（更干净）
-        pad_row = (~mask).unsqueeze(-1)   # [B,S,1]
-        seqs = seqs.masked_fill(pad_row, 0.0)
+        # pad_row = (~mask).unsqueeze(-1)   # [B,S,1]
+        # seqs = seqs.masked_fill(pad_row, 0.0)
 
         for ln_attn, attn, ln_ffn, ffn in zip(
             self.attention_layernorms,
@@ -196,13 +196,22 @@ class SASRec(nn.Module):
         """
         seqs: [B, S, D]
         mask: [B, S]
-        item_embs: [N_items, D]
+        item_embs: [B, N_items, D]
         return: [B, N_items]
         """
         log_feats = self.log2feats(seqs, mask)
-        final_feat = log_feats[:, -1, :]  # 取最后时刻
-        logits = torch.matmul(final_feat, item_embs.t())
+        final_feat = log_feats[:, -1, :].unsqueeze(1)  # 取最后时刻
+        logits = torch.matmul(final_feat, item_embs.transpose(-1,-2)).squeeze(1)  # [B, N_items]
         return logits
+    
+    @torch.no_grad()
+    def get_embeddings(self, seqs, mask):
+        """
+        seqs: [B, S, D]
+        mask: [B, S]
+        return: [B, S, D]  (时序特征)
+        """
+        return self.log2feats(seqs, mask)  # 返回时序特征
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

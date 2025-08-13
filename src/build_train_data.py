@@ -19,7 +19,7 @@ def to_idx_files(dataset_dir, train_txt, shard_size=200_000, maxlen=200):
         return None if row is None else int(row[0])
 
     out_id = 0; count = 0
-    fout = gzip.open(os.path.join(dataset_dir, f"train-{out_id:05d}.jsonl.gz"), "wb")
+    fout = gzip.open(os.path.join(dataset_dir, f"test-{out_id:05d}.jsonl.gz"), "wb")
 
     with open(os.path.join(dataset_dir, train_txt)) as f:
         for line in tqdm(f, desc="to_idx"):
@@ -43,13 +43,17 @@ def to_idx_files(dataset_dir, train_txt, shard_size=200_000, maxlen=200):
             if count % shard_size == 0:
                 fout.close()
                 out_id += 1
-                fout = gzip.open(os.path.join(dataset_dir, f"train-{out_id:05d}.jsonl.gz"), "wb")
+                fout = gzip.open(os.path.join(dataset_dir, f"test-{out_id:05d}.jsonl.gz"), "wb")
 
     fout.close(); conn.close()
     print("shards written:", out_id+1)
 
 if __name__ == "__main__":
+    # to_idx_files(
+    #     dataset_dir="/root/autodl-tmp/code_pt/data", 
+    #     train_txt="train.txt", shard_size=200_000, maxlen=200
+    #     )
     to_idx_files(
         dataset_dir="/root/autodl-tmp/code_pt/data", 
-        train_txt="train.txt", shard_size=200_000, maxlen=200
+        train_txt="test.txt", shard_size=200_000, maxlen=200
         )

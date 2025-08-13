@@ -40,6 +40,26 @@ class TrainStream(IterableDataset):
                         continue
                     yield idx[-self.maxlen:]
 
+class TestStream(IterableDataset):
+    """
+    读取 preprocess 后的 test-*.jsonl.gz
+    每次 yield: np.ndarray[int64]（长度 Li）
+    """
+    def __init__(self, dataset_dir: str, pattern="test-*.jsonl.gz", maxlen=200):
+        super().__init__()
+        self.dataset_dir = dataset_dir
+        self.files = sorted(glob.glob(os.path.join(dataset_dir, pattern)))
+        self.maxlen = maxlen
+
+    def __iter__(self):
+        for fp in self.files:
+            with gzip.open(fp, "rb") as f:
+                for line in f:
+                    obj = orjson.loads(line)
+                    idx = np.array(obj["idx"], dtype=np.int64)
+                    if idx.size <= 1: 
+                        continue
+                    yield idx[-self.maxlen:]
 # -----------------------------
 # collate：一次性取向量 + 负采样 + padding(0)
 # -----------------------------
