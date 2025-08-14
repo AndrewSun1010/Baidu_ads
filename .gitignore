@@ -19,3 +19,5 @@ __pycache__/
 *.so
 *.dylib
 *.ipynb_checkpoints
+logs/
+faiss_idx/

@@ -3,7 +3,7 @@ import os
 import time
 from datetime import date
 from tqdm import tqdm
-
+from typing import Optional
 import torch
 from torch.utils.data import DataLoader
 
@@ -11,8 +11,12 @@ from torch.utils.data import DataLoader
 from stream_datasets import TrainStream, CollateWithStore
 from evaluate import evaluate
 from model import SASRec, CustomContrastiveLoss
-
+import numpy as np
 import random, numpy as np
+import json
+import uuid
+from datetime import datetime
+
 torch.manual_seed(42); np.random.seed(42); random.seed(42)
 
 # ----------------------------
@@ -20,6 +24,39 @@ torch.manual_seed(42); np.random.seed(42); random.seed(42)
 # ----------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
+
+# 日志文件（按 run_id 区分）
+run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+metrics_dir = os.path.join(parent_dir, "logs")
+os.makedirs(metrics_dir, exist_ok=True)
+eval_log_path = os.path.join(metrics_dir, f"eval_{run_id}.jsonl")
+
+def log_eval_jsonl(tag: str, epoch: int, step: int, metrics: dict, extra: dict = None):
+    """
+    以 JSON 行的形式追加写入：
+    {
+      "ts": "2025-08-14T16:28:05",
+      "tag": "quick" / "final",
+      "epoch": 1,
+      "step": 1000,
+      "metrics": {"hitrate@10": 0.32, "ndcg@10": 0.22, "num_eval": 100},
+      "extra": {...}
+    }
+    """
+    rec = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "tag": tag,
+        "epoch": int(epoch),
+        "step": int(step),
+        "metrics": {k: (float(v) if isinstance(v, (np.floating, float)) else int(v) if isinstance(v, (np.integer, int)) else v)
+                    for k, v in metrics.items()}
+    }
+    if extra:
+        rec["extra"] = extra
+
+    with open(eval_log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
 
 class Args():
     def __init__(self):
@@ -35,13 +72,14 @@ class Args():
         self.hidden_units  = 1024
         self.emb_dim       = 1024
         self.num_blocks    = 2
-        self.num_epochs    = 1
+        self.num_epochs    = 3
         self.num_heads     = 1
         self.dropout_rate  = 0.2
         self.device        = "gpu"
         self.inference_only = False
         self.state_dict_path = None  # e.g. "2025_03_27/xxx.pth"
 
+        self.faiss_index_path = os.path.join(parent_dir, "faiss_idx", "ads_flat_ip.faiss")
         # 日志打印频率：每多少 step 打印一次（可按需修改）
         self.print_freq    = 100
 
@@ -120,7 +158,7 @@ scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.96, last_e
 print("开始训练")
 global_step = 0
 # train_torch.py 训练循环里修改
-eval_every = 1000             # 每 N step 触发一次验证
+eval_every = 1000            # 每 N step 触发一次验证
 quick_eval_batches = 10       # 中途验证只跑前50个batch（加速）；想全量就设 None
 best_metrics = {"recall@10": 0.0, "ndcg@10": 0.0}
 
@@ -170,16 +208,49 @@ for epoch in range(1, args.num_epochs + 1):
 
         # 进度条上显示平滑 loss
         pbar.set_postfix(loss=(ema_loss if ema_loss is not None else l), lr=scheduler.get_last_lr()[0])
-
+        
         # —— 中途评估（快速）——
+        model.eval()
         if (global_step % eval_every == 0):
-            quick_metrics = evaluate(model, args, device, max_batches=quick_eval_batches)
+            quick_metrics = evaluate(
+                model, args, device,
+                max_batches=quick_eval_batches,   # 只取前若干batch（数据读取更快）
+                sample_users=100,                 # 从测试集抽100条
+                faiss_index_path=args.faiss_index_path,
+            )
             print(f"\n[QuickEval @ step {global_step}] " +
-                  ", ".join([f"{k}={v:.4f}" for k, v in quick_metrics.items()]))
+                ", ".join([f"{k}={v:.4f}" for k, v in quick_metrics.items()]))
+            lr_now = scheduler.get_last_lr()[0]
+            log_eval_jsonl(
+                tag="quick",
+                epoch=epoch,
+                step=global_step,
+                metrics=quick_metrics,
+                extra={"lr": lr_now}
+            )
+
         model.train()  # 恢复训练模式
     # 学习率衰减
     scheduler.step()
     print(f"Epoch {epoch} done in {time.time()-epoch_t0:.1f}s, current lr: {scheduler.get_last_lr()[0]:.6f}")
+    # 每个 epoch 结束也跑一次完整（或同样快速）评估
+    final_metrics = evaluate(
+        model, args, device,
+        max_batches=None,   # 想全量就设 None
+        sample_users=100000,
+        faiss_index_path=args.faiss_index_path,
+    )
+    print(f"[Eval @ epoch {epoch}] " +
+        ", ".join([f"{k}={v:.4f}" for k, v in final_metrics.items()]))
+    # 记录
+    lr_now = scheduler.get_last_lr()[0]
+    log_eval_jsonl(
+        tag="quick",
+        epoch=epoch,
+        step=global_step,
+        metrics=quick_metrics,
+        extra={"lr": lr_now}
+    )
 
     # 保存
     today = date.today()

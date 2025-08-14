@@ -51,32 +51,6 @@ class CustomContrastiveLoss(nn.Module):
         loss_per_row = -(pos_lse - all_lse)                   # [BS]
         loss = loss_per_row[has_pos].mean()
         return loss
-        # # 兜底：行是否全被禁
-        # row_all_masked = ~pair_valid.any(dim=-1)         # [BS]
-        # if row_all_masked.any():
-        #     sim[row_all_masked] = 0.0                    # softmax(0...0)=均匀分布
-
-        # # softmax over columns
-        # # sim[i][j]表示预测的第i个位置的embedding与真实的第j个位置的embedding的相似度
-        # sim_prob = F.softmax(sim, dim=-1)
-
-        # # 监督：同 ad_id 视为正样（按列）
-        # label_mat = (ad_flat.unsqueeze(0) == ad_flat.unsqueeze(1)) & pair_valid
-        # label_mat = label_mat.to(sim_prob.dtype)
-
-        # # 只对正样位置计算 -log2(p)
-        # # 避免 log(0)
-        # eps = 1e-12
-        # # 将一个batch内所有非labels的样本全部作为负样本。
-        # pos_loss = -torch.log2(sim_prob.clamp_min(eps)) * label_mat
-
-        # # 按行求和，再对有效行取平均
-        # loss_per_row = pos_loss.sum(dim=-1)
-
-        # # 仅统计有至少一个正样目标的有效行；若想与原逻辑完全一致，也可直接 mean()
-        # # 这里与 Paddle 原写法一致：直接对所有行取均值
-        # loss = loss_per_row.mean()
-        # return loss
 
 
 class PointWiseFeedForward(nn.Module):
@@ -139,11 +113,6 @@ class SASRec(nn.Module):
         B, S, D = seqs.shape
         device = seqs.device
 
-        # # 绝对位置编码（从1开始；padding位置为0 -> 使用 padding_idx=0）
-        # pos = torch.arange(1, S + 1, device=device).unsqueeze(0).expand(B, S)
-        # pos = pos * mask.to(pos.dtype)  # padding 处为0
-        # pos_emb = self.pos_emb(pos.long())  # [B, S, D]
-        # mask: True=有效，False=pad
         pos_idx = mask.cumsum(dim=1) * mask      # 左侧 pad 保持 0，右侧得到 1..L
         pos_emb = self.pos_emb(pos_idx.long())
 
@@ -154,16 +123,6 @@ class SASRec(nn.Module):
         causal = torch.triu(torch.ones(S, S, dtype=torch.bool, device=device), diagonal=1)  # [S,S]
         attn_mask = causal.unsqueeze(0).expand(B, -1, -1).clone()                           # [B,S,S]
         # # 屏蔽 key 为 padding 的列
-        # attn_mask |= (~mask).unsqueeze(1).expand(B, S, S)                                   # [B,S,S]
-        # # 对 query 为 padding 的行，整行不屏蔽（否则会全 True→-inf）
-        # attn_mask &= mask.unsqueeze(-1).expand(B, S, S)                                     # [B,S,S]
-        # # MultiheadAttention 支持 3D attn_mask 形状 [B*h, S, S]
-        # num_heads = self.attention_layers[0].num_heads
-        # attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)                           # [B*h,S,S]
-
-        # 也把 Q/K/V 的 pad 行/列置0（更干净）
-        # pad_row = (~mask).unsqueeze(-1)   # [B,S,1]
-        # seqs = seqs.masked_fill(pad_row, 0.0)
 
         for ln_attn, attn, ln_ffn, ffn in zip(
             self.attention_layernorms,
@@ -174,8 +133,6 @@ class SASRec(nn.Module):
             # Pre-LN
             Q = ln_attn(seqs)
             # MultiheadAttention: (B, S, D), (B, S, D), (B, S, D)
-            # attn_mask=True 表示 masked
-            # mha_out, _ = attn(Q, seqs, seqs, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
             mha_out, _ = attn(Q, seqs, seqs, attn_mask=attn_mask)
             # mha_out = mha_out.masked_fill(~mask.unsqueeze(-1), 0.0)  # padding位置置0
             seqs = seqs + mha_out  # 残差
